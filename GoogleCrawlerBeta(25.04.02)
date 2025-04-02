@@ -1,0 +1,506 @@
+
+import os
+import hashlib
+import json
+import time
+import csv
+import re
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+from bs4 import BeautifulSoup as bs
+from selenium_stealth import stealth
+from selenium.webdriver import ActionChains
+from pinecone import Pinecone, ServerlessSpec
+
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import NoSuchElementException, TimeoutException, ElementClickInterceptedException
+
+class GoogleMapsScraper:
+
+    SORT_BUTTON_LOCATOR = (By.CSS_SELECTOR, 'button[aria-label="리뷰 정렬"], button[aria-label="Sort reviews"]') # Include English label just in case
+    LOWEST_RATING_OPTION_LOCATOR = (By.XPATH, '//div[@role="menuitemradio"][.//div[contains(text(),"낮은 평점순")]] | //div[@role="menuitemradio"][.//div[contains(text(),"Lowest rating")]]') # Korean or English
+    HIGHEST_RATING_OPTION_LOCATOR =(By.XPATH, '//div[@role="menuitemradio"][.//div[contains(text(),"높은 평점순")]] | //div[@role="menuitemradio"][.//div[contains(text(),"Lowest rating")]]')
+   
+
+    SLEEP_ONE = 1
+    SLEEP_TWO = 2
+    SLEEP_THREE = 3
+    SLEEP_FOUR = 4
+
+    def __init__(self):
+        self.driver = webdriver.Chrome()
+        self.action = ActionChains(self.driver)
+        self.init_driver_stealth()
+        # 전역적으로 처리된 리뷰 개수 관리 (동일 페이지 내에서 중복 방지)
+        self.processed_count = 0  
+
+    def init_driver_stealth(self):
+        stealth(
+            self.driver,
+            languages=["en-US", "en"],
+            vendor="Google Inc.",
+            platform="Win32",
+            webgl_vendor="Intel Inc.",
+            renderer="Intel Iris OpenGL Engine",
+            fix_hairline=True,
+        )
+
+    def navigate_to_url(self, url):
+        self.driver.get(url)
+        time.sleep(self.SLEEP_TWO)
+
+    def perform_search(self, search_loc):
+        search_input = self.driver.find_element(By.XPATH, r'//*//*[@id="searchboxinput"]')
+        search_input.send_keys(Keys.ENTER)
+        time.sleep(self.SLEEP_TWO)
+        search_area = self.driver.find_element(By.XPATH, r'//*[@id="searchboxinput"]')
+        search_area.send_keys(search_loc)
+        time.sleep(self.SLEEP_TWO)
+        search_button = self.driver.find_element(By.XPATH, r'//*[@id="searchbox-searchbutton"]')
+        search_button.send_keys(Keys.ENTER)
+
+    # def click_place(self, p):
+    #     xpath = (
+    #         r'//*[@id="QA0Szd"]/div/div/div[1]/div[2]/div/div[1]/div/div/div[1]/div[1]/div['
+    #         + str(p)
+    #         + r']/div/a'
+    #     )
+    #     element = self.driver.find_element(By.XPATH, xpath)
+    #     element.send_keys(Keys.ENTER)
+    #     time.sleep(self.SLEEP_THREE)
+
+    def get_page_soup(self):
+        html = self.driver.page_source
+        return bs(html, 'html.parser')
+
+    def extract_place_name(self, soup, p):
+        selector = (
+            '#QA0Szd > div > div > div.w6VYqd > div:nth-child(2) > div > div.e07Vkf.kA9KIf > '
+            'div > div > div.m6QErb.DxyBCb.kA9KIf.dS8AEf.XiKgde.ecceSd > '
+            'div.m6QErb.DxyBCb.kA9KIf.dS8AEf.XiKgde.ecceSd > '
+            'div:nth-child(' + str(p) + ') > div > a'
+        )
+        place_elem = soup.select_one(selector)
+        return str(place_elem.get("aria-label")) if place_elem else ""
+
+    def click_review_tab(self):
+        tab_list = self.driver.find_elements(By.CLASS_NAME, "hh2c6")
+        for tab in tab_list:
+            aria_label = tab.get_attribute('aria-label')
+            if aria_label and aria_label[-2:] == "리뷰":
+                tab.send_keys(Keys.ENTER)
+                break
+        time.sleep(5)
+
+    def scroll_review_section(self):
+        scroll_element = self.driver.find_element(
+            By.XPATH, r'//*[@id="QA0Szd"]/div/div/div[1]/div[3]/div/div[1]/div/div/div[3]'
+        )
+        for _ in range(2):
+            scroll_element.send_keys(Keys.PAGE_DOWN)
+            time.sleep(0.5)
+
+    def click_review_expand_button(self, review_element):
+        try:
+            expand_button = review_element.find_element(By.CSS_SELECTOR, '[aria-label="더보기"]')
+            self.driver.execute_script("arguments[0].click();", expand_button)
+            time.sleep(self.SLEEP_ONE)
+        except Exception:
+            pass
+
+    def extract_star_count(self, aria_label_text):
+        match = re.search(r'별표\s*(\d+)\s*개', aria_label_text)
+        return int(match.group(1)) if match else None
+
+    def parse_full_review(self, review_element):
+        review_html = review_element.get_attribute('outerHTML')
+        soup = bs(review_html, 'html.parser')
+        review_text = ""
+        review_container = soup.find('div', class_='MyEned')
+        if review_container:
+            text_span = review_container.find('span', class_='wiI7pd')
+            if text_span:
+                review_text = text_span.get_text(separator=" ", strip=True)
+        meta_data = {}
+        if review_container:
+            meta_blocks = review_container.find_all('div', class_='PBK6be')
+            for block in meta_blocks:
+                children = block.find_all('div')
+                if len(children) >= 2:
+                    label = children[0].get_text(strip=True)
+                    value = children[1].get_text(strip=True)
+                    meta_data[label] = value
+        return review_text, meta_data
+
+    def extract_reviews(self, place_name):
+        """
+        스크롤을 내릴 때마다 새로운 리뷰가 로드될 때까지 명시적으로 기다린 후,
+        이미 처리된 리뷰(self.processed_count) 이후의 새 리뷰만 처리한다.
+        """
+        review_list = []
+        no_new_review_iterations = 0
+        max_no_new_review = 3
+
+        while True:
+            self.scroll_review_section()
+            # new_elements가 나타날 때까지 최대 5초간 기다림
+            try:
+                WebDriverWait(self.driver, 5).until(
+                    lambda d: len(d.find_elements(By.CSS_SELECTOR, "div.jJc9Ad")) > self.processed_count
+                )
+            except TimeoutException:
+                no_new_review_iterations += 1
+                if no_new_review_iterations >= max_no_new_review:
+                    break
+                else:
+                    continue
+            review_elements = self.driver.find_elements(By.CSS_SELECTOR, "div.jJc9Ad")
+            total_count = len(review_elements)
+            new_elements = review_elements[self.processed_count:]
+            
+            if new_elements:
+                no_new_review_iterations = 0
+                for review_element in new_elements:
+                    try:
+                        self.click_review_expand_button(review_element)
+                        self.driver.execute_script("arguments[0].scrollIntoView(true);", review_element)
+                        time.sleep(self.SLEEP_ONE)
+                        
+                        try:
+                            star_element = review_element.find_element(By.CSS_SELECTOR, 'span.kvMYJc[aria-label]')
+                            star_label = star_element.get_attribute('aria-label')
+                            star_rating = self.extract_star_count(star_label)
+                        except Exception:
+                            star_rating = None
+
+                        try:
+                            date_element = review_element.find_element(By.CSS_SELECTOR, 'span.rsqaWe')
+                            review_date = date_element.text
+                        except Exception:
+                            review_date = None
+
+                        review_text, meta_data = self.parse_full_review(review_element)
+                        
+
+                        try:
+                           like_element = self.driver.find_element(By.CLASS_NAME, 'pkWtMe')
+                           like_count = like_element.text
+                        except NoSuchElementException:
+                           like_count = '0'  #숫자로 바꾸는 것을 고려해봐야 할지도 모른다. 
+
+                        review_list.append([place_name, review_text, star_rating,like_count, review_date, meta_data])
+                        time.sleep(self.SLEEP_ONE)
+                    except Exception:
+                        continue
+
+                # 새로 처리한 만큼 전체 리뷰 개수를 업데이트
+                print(f"현재 까지 리뷰 개수:::'{total_count}'")
+                self.processed_count = total_count
+                #break
+            else:
+                no_new_review_iterations += 1
+                if no_new_review_iterations >= max_no_new_review:
+                    break
+
+        return review_list
+
+    def save_reviews_to_csv(self, filename, review_list, header, mode='w'):
+        with open(filename, mode, encoding='utf-8-sig', newline='') as f:
+            writer = csv.writer(f)
+            if mode == 'w':
+                writer.writerow(header)
+            for review in review_list:
+                writer.writerow(review)
+
+    # def upsert_reviews_to_pinecone(self, review_list, model, index_name="tourism-review-index", dimension=384):
+    #     keyManager = APIKeyManager()
+    #     PINECONE_API_KEY = keyManager.get_key("pinecone")  # #your Pinecone API key
+        
+    #     pc = Pinecone(api_key=PINECONE_API_KEY)
+    #     current_indexes = [idx.name for idx in pc.list_indexes()]
+    #     if index_name not in current_indexes:
+    #         pc.create_index(
+    #             name=index_name,
+    #             dimension=dimension,
+    #             metric='cosine',
+    #             spec=ServerlessSpec(
+    #                 cloud='aws',
+    #                 region='us-east-1'
+    #             )
+    #         )
+    #     index_info = pc.describe_index(index_name)
+    #     host = index_info.get("host", "")
+    #     if not host:
+    #         raise ValueError("Pinecone index host 정보를 가져올 수 없음.")
+        
+    #     tokens = host.split(".")
+    #     if len(tokens) >= 3:
+    #         environment = tokens[2]
+    #     else:
+    #         raise ValueError(f"host 파싱 실패: {host}")
+        
+    #     pc = Pinecone(api_key=PINECONE_API_KEY, environment=environment)
+    #     index = pc.Index(index_name)
+        
+    #     vectors = []
+    #     for i, review in enumerate(review_list):
+    #         place_name, review_text, star_rating, review_date, meta_data = review
+    #         embedding = model.encode([review_text])[0].tolist()
+    #         vector_id = self.generate_vector_id(place_name, i)
+    #         if star_rating is None:
+    #             star_rating = 0
+    #         if review_date is None:
+    #             review_date = ""
+    #         if isinstance(meta_data, dict):
+    #             meta_data_str = json.dumps(meta_data)
+    #         else:
+    #             meta_data_str = meta_data
+    #         metadata = {
+    #             "place_name": place_name,
+    #             "review_text": review_text,
+    #             "star_rating": star_rating,
+    #             "review_date": review_date,
+    #             "meta_data": meta_data_str
+    #         }
+    #         vectors.append((vector_id, embedding, metadata))
+    #     index.upsert(vectors)
+
+    # def load_embedding_model(self, model_name="sentence-transformers/all-MiniLM-L6-v2"):
+    #     return SentenceTransformer(model_name) 
+
+    def generate_vector_id(self, place_name, idx):
+        hashed = hashlib.sha256(place_name.encode('utf-8')).hexdigest()  
+        return f"{hashed}_{idx}"
+
+    def close(self):
+        self.driver.quit()
+
+
+
+    def _wait_and_click(self, locator: tuple, description: str, timeout: int = 10) -> bool:
+        """Waits for an element to be clickable and clicks it."""
+        if not hasattr(self, 'driver') or not self.driver:
+            print("Error: Driver not available.")
+            return False
+        if not hasattr(self, 'wait') or not self.wait:
+            print("Error: WebDriverWait not available.")
+            # Use a temporary wait if needed, though self.wait should exist
+            wait = WebDriverWait(self.driver, timeout)
+        else:
+             # Use instance's wait, but allow override timeout
+            wait = self.wait if timeout == self.wait._timeout else WebDriverWait(self.driver, timeout)
+
+        retries = 2 # Number of retries for ElementClickInterceptedException
+        for attempt in range(retries + 1):
+            try:
+                print(f"Waiting for '{description}' ({locator}) to be clickable...")
+                element = wait.until(EC.element_to_be_clickable(locator))
+
+                # Scroll into view slightly above the element for better visibility
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});", element)
+                time.sleep(self.SLEEP_ONE / 2) # Short pause after scroll
+
+                print(f"Clicking '{description}' (Attempt {attempt + 1})...")
+                element.click()
+                print(f"'{description}' clicked successfully.")
+                return True
+
+            except ElementClickInterceptedException:
+                print(f"Warn: Click intercepted for '{description}'. Retrying ({attempt + 1}/{retries + 1})...")
+                time.sleep(self.SLEEP_ONE) # Wait a bit before retrying
+                if attempt == retries:
+                     print(f"Error: Click for '{description}' intercepted after {retries + 1} attempts.")
+                     return False
+            except TimeoutException:
+                print(f"Error: Timed out waiting for '{description}' ({locator}).")
+                return False # Don't retry timeout
+            except NoSuchElementException:
+                print(f"Error: Could not find '{description}' ({locator}).")
+                return False # Don't retry if not found
+            except Exception as e:
+                print(f"Error clicking '{description}': {e}")
+                return False # Don't retry general errors
+
+        return False # Should not be reached if logic is correct
+
+
+    # --- NEW METHOD: Sort reviews by lowest rating ---
+    def sort_reviews_by_lowest(self) -> bool:
+        """
+        Clicks the sort button and selects 'Lowest rating first' on the reviews tab.
+        Assumes the reviews tab is already open.
+
+        Returns:
+            bool: True if sorting was likely successful, False otherwise.
+        """
+        print("\n--- Attempting to sort reviews by lowest rating ---")
+
+        # 1. Find and Click Sort Button
+        if not self._wait_and_click(self.SORT_BUTTON_LOCATOR, "Sort Button", timeout=15):
+            print("Failed to click the Sort Button. Cannot sort reviews.")
+            # It's possible reviews are already sorted or the button isn't there.
+            # Depending on requirements, you might want to continue or stop.
+            # For now, we'll return False but let the main logic decide.
+            return False
+
+        # Brief pause for the dropdown menu to appear
+        time.sleep(self.SLEEP_ONE)
+
+        # 2. Find and Click Lowest Rating Option
+        if not self._wait_and_click(self.LOWEST_RATING_OPTION_LOCATOR, "Lowest Rating Option", timeout=10):
+            print("Failed to click the 'Lowest Rating' option. Sorting may not have occurred.")
+            # Might happen if the menu didn't open correctly or locator is wrong.
+            return False
+
+        # Wait for sorting to apply visually (adjust time if needed)
+        print("Waiting briefly for sorting to apply...")
+        time.sleep(self.SLEEP_THREE)
+
+        print("--- Sorting by lowest rating command sequence completed ---")
+        return True   
+    
+    def sort_reviews_by_highest(self) -> bool:
+        """
+        Clicks the sort button and selects 'Lowest rating first' on the reviews tab.
+        Assumes the reviews tab is already open.
+
+        Returns:
+            bool: True if sorting was likely successful, False otherwise.
+        """
+        print("\n--- Attempting to sort reviews by Highest rating ---")
+
+        # 1. Find and Click Sort Button
+        if not self._wait_and_click(self.SORT_BUTTON_LOCATOR, "Sort Button", timeout=15):
+            print("Failed to click the Sort Button. Cannot sort reviews.")
+            # It's possible reviews are already sorted or the button isn't there.
+            # Depending on requirements, you might want to continue or stop.
+            # For now, we'll return False but let the main logic decide.
+            return False
+
+        # Brief pause for the dropdown menu to appear
+        time.sleep(self.SLEEP_ONE)
+
+        # 2. Find and Click Lowest Rating Option
+        if not self._wait_and_click(self.HIGHEST_RATING_OPTION_LOCATOR, "highest Rating Option", timeout=10):
+            print("Failed to click the 'highest Rating' option. Sorting may not have occurred.")
+            # Might happen if the menu didn't open correctly or locator is wrong.
+            return False
+
+        # Wait for sorting to apply visually (adjust time if needed)
+        print("Waiting briefly for sorting to apply...")
+        time.sleep(self.SLEEP_THREE)
+
+        print("--- Sorting by highest rating command sequence completed ---")
+        return True   
+
+
+    def click_place(self, p):
+        while True:
+            try:
+                xpath = (
+                    r'//*[@id="QA0Szd"]/div/div/div[1]/div[2]/div/div[1]/div/div/div[1]/div[1]/div['
+                    + str(p)
+                    + r']/div/a'
+                )
+                # 요소가 클릭 가능할 때까지 명시적 대기
+                element = WebDriverWait(self.driver, 10).until(
+                    EC.element_to_be_clickable((By.XPATH, xpath))
+                )
+                print("뭐야 찾은겨?")
+                element.click()  # send_keys 대신 click() 사용
+                print("클릭까지 한겨 아니여?")
+                time.sleep(self.SLEEP_THREE)        
+                break
+            except Exception:
+                scroll_element = self.driver.find_element(
+                    By.XPATH, r'//*[@id="QA0Szd"]/div/div/div[1]/div[2]/div/div[1]/div/div/div[1]/div[1]'
+                )
+                for _ in range(2):
+                    scroll_element.send_keys(Keys.PAGE_DOWN)
+                    time.sleep(0.5)
+                print("못 찾았노??")    
+                continue    
+
+def main():
+    scraper = GoogleMapsScraper()
+    url = 'https://www.google.com/maps'
+    scraper.navigate_to_url(url)
+
+    search_loc = '서울 관광지'
+    scraper.perform_search(search_loc)
+
+  
+    filename = './test_demo.csv'
+    header = ['place_name', 'review_text', 'star_rating','likes' ,'review_date','meta_data']
+        
+
+    for placeNumber in range(13,100,2): //중요!! 13부터 시작하기는 했는데.. 사실 규칙은 (3,5,7,9,11,13.... 등차수열...)
+        # 예시로 3번째 장소 선택
+        scraper.click_place(placeNumber)
+        soup = scraper.get_page_soup()
+        place_name = scraper.extract_place_name(soup, placeNumber)
+        print("선택된 장소:", place_name)
+        time.sleep(scraper.SLEEP_FOUR)
+        
+        scraper.click_review_tab()
+        
+
+
+        if not scraper.sort_reviews_by_lowest():
+                print(f"Warning: Failed to sort reviews for {place_name}. Proceeding with default order.")
+
+        reviews = scraper.extract_reviews(place_name)
+        print(f"닞은 순으로 추출--- {recursion}회차 - 총 {len(reviews)}개의 리뷰 수집")
+        for review in reviews:
+            print(review)
+
+        # if recursion == 0:
+        #     scraper.save_reviews_to_csv(filename, reviews, header, mode='w')
+        # else:
+        #     scraper.save_reviews_to_csv(filename, reviews, header, mode='a')
+
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(project_dir, 'test3.csv')
+
+
+        #print(file_path)
+        # 파일 존재 여부에 따라 저장 모드를 선택한다.
+        if os.path.exists(file_path):
+            scraper.save_reviews_to_csv(file_path, reviews, header, mode='a')
+        else:
+            scraper.save_reviews_to_csv(file_path, reviews, header, mode='w')
+
+
+
+        if not scraper.sort_reviews_by_highest():
+                print(f"Warning: Failed to sort reviews for {place_name}. Proceeding with default order.")
+
+        reviews = scraper.extract_reviews(place_name)
+        print(f"높은 순으로 추출--- {recursion}회차 - 총 {len(reviews)}개의 리뷰 수집")
+        for review in reviews:
+            print(review)
+
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(project_dir, 'test3.csv')
+
+
+        if os.path.exists(file_path):
+            scraper.save_reviews_to_csv(file_path, reviews, header, mode='a')
+        else:
+            scraper.save_reviews_to_csv(file_path, reviews, header, mode='w')    
+
+
+        time.sleep(2)
+
+
+
+
+    print("성공")
+    scraper.close()
+
+if __name__ == "__main__":
+    main()
