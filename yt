@@ -1,0 +1,35 @@
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, TextClassificationPipeline
+from datasets import load_dataset
+import pandas as pd
+import torch
+
+tokenizer = AutoTokenizer.from_pretrained("searle-j/kote_for_easygoing_people")
+dataset = load_dataset("searle-j/kote", trust_remote_code=True)
+model = AutoModelForSequenceClassification.from_pretrained("searle-j/kote_for_easygoing_people")
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# 감정 분석 모델 설정
+pipe = TextClassificationPipeline(
+    model=model,
+    tokenizer=tokenizer,
+    device=-1, # gpu number, -1 if cpu used
+    top_k=10, # return_all_scores=True 대신 사용
+
+    function_to_apply='sigmoid' # 모델의 특성에 따라 변경 가능
+)
+
+#print(dataset)
+#df_train = pd.DataFrame(dataset['train'])
+#print(df_train['text'])
+text = ["민속촌과 비교하자면 우선 서울시내에 있어  대중 교통 접근성이 좋고 입장료가 없다는게 장점이라 할수있겠지만 규모가 민속촌에 비교하기 민망할정도로 작고 주차가 어렵습니다근처 4대 궁에 비교해도 기대를 크게 갖을 부분은 없지싶어요 타임캡슐의 상징적인 느낌에 고풍스러운 느낌의 공원정도로 생각하면 비슷할거같습니다", "스토리가 너무 지루하고 연기도 별로였어요.", "생각보다 재미있어서 놀랐어요.", "재미있었지만 연기가 아쉬웠어요"]
+pip_text = pipe(text)
+
+# pipe를 거친 결과들에 대하여
+# 각 감정에 해당할 확률(score)이 0.4 이상인 감정들만 출력
+for i in range(len(pip_text)):
+    print(f"리뷰: {text[i]}")
+    for output in pip_text[i]:
+        if output["score"] > 0.2:
+            print(output)
+    print("\n")
